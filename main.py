@@ -1,8 +1,10 @@
 import os
+import json
 import threading
 from flask import Flask
 import telebot
 import yfinance as yf
+import feedparser
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # 1. Web server for Render keep-alive
@@ -16,165 +18,214 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# 2. Telegram Bot Configuration
+# 2. Telegram Bot & Persistent Subscribers
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 bot = telebot.TeleBot(TOKEN)
-subscribers = set()
+SUBS_FILE = "subscribers.json"
+
+def load_subscribers():
+    if os.path.exists(SUBS_FILE):
+        try:
+            with open(SUBS_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_subscriber(chat_id):
+    subscribers.add(chat_id)
+    try:
+        with open(SUBS_FILE, "w") as f:
+            json.dump(list(subscribers), f)
+    except Exception:
+        pass
+
+subscribers = load_subscribers()
 alert_sent_today = False
+
+# Helper function to fetch price & daily % change
+def get_asset_data(symbol):
+    ticker = yf.Ticker(symbol).history(period="2d")
+    if ticker.empty:
+        return None, None
+    price = ticker['Close'].iloc[-1]
+    prev = ticker['Close'].iloc[-2] if len(ticker) > 1 else price
+    change = ((price - prev) / prev) * 100
+    return price, change
+
+def format_line(icon_label, price, change, unit=""):
+    if price is None:
+        return f"{icon_label}: `N/A`\n"
+    trend = "🟢" if change >= 0 else "🔴"
+    return f"{icon_label}: `{price:.2f}{unit}` ({trend} {change:+.2f}%)\n"
+
+# Fetch top 3 Macro/Geopolitics headlines via RSS
+def fetch_geopolitics_news(limit=3):
+    rss_urls = [
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258", # CNBC Economy
+        "https://feeds.bbci.co.uk/news/world/rss.xml" # BBC World Geopolitics
+    ]
+    headlines = []
+    for url in rss_urls:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:2]:
+                headlines.append(f"• [{entry.title}]({entry.link})")
+        except Exception:
+            continue
+    return "\n".join(headlines[:limit]) if headlines else "• No major news fetched right now."
 
 def send_daily_briefing():
     global alert_sent_today
-    alert_sent_today = False  # Reset DCA alert flag for the new day
+    alert_sent_today = False
     if not subscribers:
         return
-    try:
-        sp = yf.Ticker("^GSPC").history(period="2d")
-        nasdaq = yf.Ticker("^IXIC").history(period="2d")
-        cac = yf.Ticker("^FCHI").history(period="2d")
-        btc = yf.Ticker("BTC-USD").history(period="1d")
 
-        sp_price = sp['Close'].iloc[-1]
-        sp_prev = sp['Close'].iloc[-2] if len(sp) > 1 else sp_price
-        sp_change = ((sp_price - sp_prev) / sp_prev) * 100
+    sp_p, sp_c = get_asset_data("^GSPC")
+    nq_p, nq_c = get_asset_data("^IXIC")
+    cac_p, cac_c = get_asset_data("^FCHI")
+    btc_p, btc_c = get_asset_data("BTC-USD")
+    
+    # Macro & Metals
+    gold_p, gold_c = get_asset_data("GC=F")
+    silver_p, silver_c = get_asset_data("SI=F")
+    us10y_p, us10y_c = get_asset_data("^TNX")
+    vix_p, vix_c = get_asset_data("^VIX")
 
-        nasdaq_price = nasdaq['Close'].iloc[-1]
-        nasdaq_prev = nasdaq['Close'].iloc[-2] if len(nasdaq) > 1 else nasdaq_price
-        nasdaq_change = ((nasdaq_price - nasdaq_prev) / nasdaq_prev) * 100
+    news_block = fetch_geopolitics_news(limit=3)
 
-        cac_price = cac['Close'].iloc[-1]
-        cac_prev = cac['Close'].iloc[-2] if len(cac) > 1 else cac_price
-        cac_change = ((cac_price - cac_prev) / cac_prev) * 100
+    briefing_text = (
+        "☀️ **DAILY MACRO & MARKET BRIEFING** ☀️\n\n"
+        "**📈 EQUITIES & CRYPTO**\n"
+        + format_line("📊 **S&P 500**", sp_p, sp_c, " USD")
+        + format_line("💻 **Nasdaq**", nq_p, nq_c, " USD")
+        + format_line("🇫🇷 **CAC 40**", cac_p, cac_c, " EUR")
+        + format_line("🪙 **Bitcoin**", btc_p, btc_c, " USD")
+        + "\n**🌐 MACRO, METALS & VOLATILITY**\n"
+        + format_line("🥈 **Silver**", silver_p, silver_c, " USD")
+        + format_line("🥇 **Gold**", gold_p, gold_c, " USD")
+        + format_line("🇺🇸 **US 10Y Yield**", us10y_p, us10y_c, "%")
+        + format_line("⚡ **VIX (Fear)**", vix_p, vix_c, "")
+        + f"\n**🌍 GEOPOLITICS & MACRO HEADLINES**\n{news_block}\n\n"
+        "Have a sharp trading day! 🚀"
+    )
 
-        btc_price = btc['Close'].iloc[-1]
-
-        sp_icon = "🟢" if sp_change >= 0 else "🔴"
-        nasdaq_icon = "🟢" if nasdaq_change >= 0 else "🔴"
-        cac_icon = "🟢" if cac_change >= 0 else "🔴"
-
-        briefing_text = (
-            "☀️ **Daily Morning Market Briefing** ☀️\n\n"
-            f"📊 **S&P 500**: `{sp_price:.2f} USD` ({sp_icon} {sp_change:+.2f}%)\n"
-            f"💻 **Nasdaq**: `{nasdaq_price:.2f} USD` ({nasdaq_icon} {nasdaq_change:+.2f}%)\n"
-            f"🇫🇷 **CAC 40**: `{cac_price:.2f} EUR` ({cac_icon} {cac_change:+.2f}%)\n"
-            f"🪙 **Bitcoin**: `{btc_price:.2f} USD`\n\n"
-            "Have a great trading day! 🚀"
-        )
-
-        for chat_id in list(subscribers):
-            try:
-                bot.send_message(chat_id, briefing_text, parse_mode="Markdown")
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"Error fetching briefing data: {e}")
+    for chat_id in list(subscribers):
+        try:
+            bot.send_message(chat_id, briefing_text, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception:
+            pass
 
 def check_dca_alerts():
     global alert_sent_today
     if not subscribers or alert_sent_today:
         return
-    try:
-        sp = yf.Ticker("^GSPC").history(period="2d")
-        if len(sp) > 1:
-            sp_price = sp['Close'].iloc[-1]
-            sp_prev = sp['Close'].iloc[-2]
-            sp_change = ((sp_price - sp_prev) / sp_prev) * 100
+    sp_p, sp_c = get_asset_data("^GSPC")
+    if sp_c is not None and sp_c <= -1.5:
+        alert_sent_today = True
+        alert_text = (
+            "🚨 **DCA OPPORTUNITY ALERT** 🚨\n\n"
+            f"📉 **S&P 500** dropped `{sp_c:.2f}%` today (`{sp_p:.2f} USD`)!\n"
+            "💡 *Strategic Dollar-Cost Averaging window.*"
+        )
+        for chat_id in list(subscribers):
+            try:
+                bot.send_message(chat_id, alert_text, parse_mode="Markdown")
+            except Exception:
+                pass
 
-            # Trigger DCA Alert if S&P 500 drops >= 1.5%
-            if sp_change <= -1.5:
-                alert_sent_today = True
-                alert_text = (
-                    "🚨 **DCA OPPORTUNITY ALERT** 🚨\n\n"
-                    f"📉 **S&P 500** dropped `{sp_change:.2f}%` today!\n"
-                    f"Current Price: `{sp_price:.2f} USD`\n\n"
-                    "💡 *Market dips can present strategic Dollar-Cost Averaging opportunities.*"
-                )
-                for chat_id in list(subscribers):
-                    try:
-                        bot.send_message(chat_id, alert_text, parse_mode="Markdown")
-                    except Exception:
-                        pass
-    except Exception as e:
-        print(f"Error checking DCA alert: {e}")
-
-# Scheduler setup (Europe/Paris timezone)
+# Scheduler (8:00 AM Paris time)
 scheduler = BackgroundScheduler(timezone="Europe/Paris")
 scheduler.add_job(send_daily_briefing, 'cron', hour=8, minute=0)
 scheduler.add_job(check_dca_alerts, 'interval', minutes=30)
 scheduler.start()
 
+# Bot Commands
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    subscribers.add(message.chat.id)
+    save_subscriber(message.chat.id)
     welcome_text = (
         "📈 **Welcome to Amine Finance Alert!**\n\n"
-        " You are registered for **Daily Briefings (8:00 AM)** & **DCA Dip Alerts**!\n\n"
-        "Available commands:\n"
-        "• `/sp500` : Get S&P 500 index price\n"
-        "• `/nasdaq` : Get Nasdaq Composite price\n"
-        "• `/cac40` : Get CAC 40 index price\n"
-        "• `/btc` : Get Bitcoin price\n"
-        "• `/price SYMBOL` : Get stock/ETF price (e.g. `/price AAPL` or `/price NVDA`)\n"
-        "• `/briefing` : Get daily market briefing immediately\n"
+        "You are subscribed to the **8:00 AM Macro & Geopolitics Briefing** & **DCA Alerts**.\n\n"
+        "**Commands:**\n"
+        "• `/macro` : Silver, Gold, US 10Y, DXY, Oil & VIX\n"
+        "• `/news` : Live Geopolitics & Macro headlines\n"
+        "• `/briefing` : Trigger full morning briefing now\n"
+        "• `/sp500`, `/nasdaq`, `/cac40`, `/btc`\n"
+        "• `/price SYMBOL` : Any stock/ETF/commodity\n"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
+@bot.message_handler(commands=['macro'])
+def get_macro(message):
+    save_subscriber(message.chat.id)
+    silver_p, silver_c = get_asset_data("SI=F")
+    gold_p, gold_c = get_asset_data("GC=F")
+    us10y_p, us10y_c = get_asset_data("^TNX")
+    dxy_p, dxy_c = get_asset_data("DX-Y.NYB")
+    oil_p, oil_c = get_asset_data("CL=F")
+    vix_p, vix_c = get_asset_data("^VIX")
+
+    macro_text = (
+        "🌐 **GLOBAL MACRO & COMMODITIES**\n\n"
+        + format_line("🥈 **Silver (XAG)**", silver_p, silver_c, " USD")
+        + format_line("🥇 **Gold (XAU)**", gold_p, gold_c, " USD")
+        + format_line("🇺🇸 **US 10Y Yield**", us10y_p, us10y_c, "%")
+        + format_line("💵 **Dollar Index (DXY)**", dxy_p, dxy_c, "")
+        + format_line("🛢️ **Crude Oil (WTI)**", oil_p, oil_c, " USD")
+        + format_line("⚡ **VIX Volatility**", vix_p, vix_c, "")
+    )
+    bot.reply_to(message, macro_text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['news'])
+def get_news(message):
+    save_subscriber(message.chat.id)
+    news_block = fetch_geopolitics_news(limit=5)
+    bot.reply_to(message, f"🌍 **LATEST MACRO & GEOPOLITICS NEWS**\n\n{news_block}", parse_mode="Markdown", disable_web_page_preview=True)
+
 @bot.message_handler(commands=['briefing'])
 def trigger_briefing(message):
-    subscribers.add(message.chat.id)
-    bot.reply_to(message, "🔄 Fetching market briefing...")
+    save_subscriber(message.chat.id)
+    bot.reply_to(message, "🔄 Compiling Macro, Metals & Geopolitics briefing...")
     send_daily_briefing()
 
-def fetch_index(message, symbol, name, currency):
-    try:
-        ticker = yf.Ticker(symbol).history(period="2d")
-        price = ticker['Close'].iloc[-1]
-        prev = ticker['Close'].iloc[-2] if len(ticker) > 1 else price
-        change = ((price - prev) / prev) * 100
-        icon = "🟢" if change >= 0 else "🔴"
-        bot.reply_to(message, f"📊 **{name}** : `{price:.2f} {currency}` ({icon} {change:+.2f}%)", parse_mode="Markdown")
-    except Exception:
-        bot.reply_to(message, f"⚠️ Error fetching {name} price.")
+def send_single_index(message, symbol, name, currency):
+    save_subscriber(message.chat.id)
+    p, c = get_asset_data(symbol)
+    if p is None:
+        bot.reply_to(message, f"⚠️ Error fetching {name}.")
+    else:
+        bot.reply_to(message, format_line(f"📊 **{name}**", p, c, f" {currency}"), parse_mode="Markdown")
 
 @bot.message_handler(commands=['sp500'])
 def get_sp500(message):
-    subscribers.add(message.chat.id)
-    fetch_index(message, "^GSPC", "S&P 500", "USD")
+    send_single_index(message, "^GSPC", "S&P 500", "USD")
 
 @bot.message_handler(commands=['nasdaq'])
 def get_nasdaq(message):
-    subscribers.add(message.chat.id)
-    fetch_index(message, "^IXIC", "Nasdaq", "USD")
+    send_single_index(message, "^IXIC", "Nasdaq", "USD")
 
 @bot.message_handler(commands=['cac40'])
 def get_cac40(message):
-    subscribers.add(message.chat.id)
-    fetch_index(message, "^FCHI", "CAC 40", "EUR")
+    send_single_index(message, "^FCHI", "CAC 40", "EUR")
 
 @bot.message_handler(commands=['btc'])
 def get_btc(message):
-    subscribers.add(message.chat.id)
-    fetch_index(message, "BTC-USD", "Bitcoin", "USD")
+    send_single_index(message, "BTC-USD", "Bitcoin", "USD")
 
 @bot.message_handler(commands=['price', 'prix'])
 def get_price(message):
-    subscribers.add(message.chat.id)
+    save_subscriber(message.chat.id)
     try:
         symbol = message.text.split()[1].upper()
-        ticker = yf.Ticker(symbol).history(period="2d")
-        if ticker.empty:
-            bot.reply_to(message, f"❌ Ticker symbol '{symbol}' not found.")
-            return
-        price = ticker['Close'].iloc[-1]
-        prev = ticker['Close'].iloc[-2] if len(ticker) > 1 else price
-        change = ((price - prev) / prev) * 100
-        icon = "🟢" if change >= 0 else "🔴"
-        bot.reply_to(message, f"📈 **{symbol}** : `{price:.2f}` ({icon} {change:+.2f}%)", parse_mode="Markdown")
+        p, c = get_asset_data(symbol)
+        if p is None:
+            bot.reply_to(message, f"❌ Ticker '{symbol}' not found.")
+        else:
+            bot.reply_to(message, format_line(f"📈 **{symbol}**", p, c, ""), parse_mode="Markdown")
     except IndexError:
-        bot.reply_to(message, "⚠️ Please specify a symbol. Example: `/price AAPL` or `/price NVDA`.")
-    except Exception:
-        bot.reply_to(message, "⚠️ Error fetching price data.")
+        bot.reply_to(message, "⚠️ Specify a symbol. Example: `/price SI=F` or `/price NVDA`.")
 
-# 3. Launch server & polling
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
     bot.infinity_polling()
