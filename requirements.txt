@@ -2,3 +2,4 @@ pyTelegramBotAPI
 yfinance
 flask
 apscheduler
+feedparser
